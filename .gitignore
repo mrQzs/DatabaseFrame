@@ -1,0 +1,9 @@
+/build
+/debug
+/release
+/.qmake.stash
+/DataBase.pro.user
+/Makefile
+/Makefile.Debug
+/Makefile.Release
+/bin

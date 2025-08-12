@@ -21,21 +21,13 @@ OBJECTS_DIR = $$PWD/build/obj
 MOC_DIR = $$PWD/build/moc
 RCC_DIR = $$PWD/build/rcc
 
-# 源文件
-SOURCES += \
-    BaseDatabaseManager.cpp \
-    DatabaseFramework.cpp \
-    DatabaseRegistry.cpp \
-    DeviceDatabaseManager.cpp \
-    main.cpp
+INCLUDEPATH += $$PWD/Base
+INCLUDEPATH += $$PWD/FrameWork
+INCLUDEPATH += $$PWD/Functions
+INCLUDEPATH += $$PWD/Registry
+INCLUDEPATH += $$PWD/Test
 
-# 头文件
-HEADERS += \
-    BaseDatabaseManager.h \
-    DatabaseFramework.h \
-    DatabaseRegistry.h \
-    DatabaseTestExample.h \
-    DeviceDatabaseManager.h
+
 
 # 编译器警告选项
 gcc {
@@ -57,3 +49,17 @@ CONFIG(debug, debug|release) {
 } else {
     TARGET = DeviceManager
 }
+
+HEADERS += \
+    Base/BaseDatabaseManager.h \
+    FrameWork/DatabaseFramework.h \
+    Functions/DeviceDatabaseManager.h \
+    Registry/DatabaseRegistry.h \
+    Test/DatabaseTestExample.h
+
+SOURCES += \
+    Base/BaseDatabaseManager.cpp \
+    FrameWork/DatabaseFramework.cpp \
+    Functions/DeviceDatabaseManager.cpp \
+    Registry/DatabaseRegistry.cpp \
+    main.cpp
