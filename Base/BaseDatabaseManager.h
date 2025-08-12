@@ -10,6 +10,7 @@
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QThread>
 #include <QTimer>
 #include <memory>
 #include <unordered_map>
@@ -28,6 +29,19 @@ class ConnectionPool {
   QSet<QString> m_usedConnections;         ///< 已使用连接集合
   mutable QMutex m_mutex;                  ///< 线程安全锁
   int m_connectionCounter = 0;             ///< 连接计数器
+  QHash<QString, QQueue<QString>> m_availableByThread;  // key: threadId
+  QHash<QString, QString> m_connOwner;                  // connName -> threadId
+  QHash<QString, QString>
+      m_activeTxByThread;  // threadId -> connName  (活动事务绑定)
+
+  static QString currentTid() {
+    return QString::number(reinterpret_cast<qintptr>(QThread::currentThread()));
+  }
+  int totalConnectionsUnsafe() const {
+    int n = m_usedConnections.size();
+    for (const auto& q : m_availableByThread) n += q.size();
+    return n;
+  }
 
  public:
   /**
@@ -72,11 +86,19 @@ class ConnectionPool {
    */
   QString createConnection();
 
+  QString createConnectionInCurrentThread();
+
   /**
    * @brief 配置数据库连接
    * @param db 数据库对象
    */
   void configureDatabase(QSqlDatabase& db);
+
+ public:
+  // 线程级事务：开始/提交/回滚（绑定当前线程的一条连接）
+  QString beginThreadTransaction();  // 返回绑定的连接名（失败则为空）
+  bool commitThreadTransaction();    // 提交并释放绑定
+  bool rollbackThreadTransaction();  // 回滚并释放绑定
 };
 
 /**

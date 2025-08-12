@@ -97,45 +97,6 @@ DbResult<bool> DatabaseConfig::validate() const {
 }
 
 // ============================================================================
-// PreparedStatementCache实现
-// ============================================================================
-
-PreparedStatementCache::PreparedStatementCache(QSqlDatabase* db, int maxSize)
-    : m_database(db), m_maxCacheSize(maxSize) {}
-
-PreparedStatementCache::~PreparedStatementCache() {}
-
-std::shared_ptr<QSqlQuery> PreparedStatementCache::getOrCreateQuery(
-    const QString& sql) {
-  QMutexLocker locker(&m_cacheMutex);
-
-  auto it = m_cache.find(sql);
-  if (it != m_cache.end()) {
-    m_stats.hitCount++;
-    return it.value();
-  }
-
-  m_stats.missCount++;
-
-  // 检查缓存大小，必要时清理
-  if (m_cache.size() >= m_maxCacheSize) {
-    evictOldest();
-  }
-
-  auto query = std::make_shared<QSqlQuery>(*m_database);
-  if (query->prepare(sql)) {
-    m_cache[sql] = query;
-    return query;
-  }
-
-  return nullptr;
-}
-
-void PreparedStatementCache::clearCache() {}
-
-void PreparedStatementCache::evictOldest() {}
-
-// ============================================================================
 // BaseTableOperations实现
 // ============================================================================
 
@@ -147,8 +108,7 @@ BaseTableOperations::BaseTableOperations(QSqlDatabase* db,
       m_database(db),
       m_tableName(tableName),
       m_tableType(tableType),
-      m_pool(pool),
-      m_stmtCache(std::make_unique<PreparedStatementCache>(db)) {
+      m_pool(pool) {
   logOperation("构造函数", QString("表操作对象已创建: %1").arg(tableName));
 }
 
@@ -241,25 +201,6 @@ bool BaseTableOperations::executeQuery(const QString& sql,
 
   qDebug() << QString("SQL成功 [%1ms]").arg(ms);
   return true;
-}
-
-bool BaseTableOperations::executeCachedQuery(const QString& sql,
-                                             const QVariantList& params) const {
-  auto c = acquireDb();
-  if (!c.db.isOpen()) return false;
-
-  auto queryPtr = m_stmtCache->getOrCreateQuery(sql);
-  if (!queryPtr) return false;
-
-  // 重新绑定到当前连接
-  *queryPtr = QSqlQuery(c.db);
-  queryPtr->prepare(sql);
-
-  for (const auto& param : params) {
-    queryPtr->addBindValue(param);
-  }
-
-  return queryPtr->exec();
 }
 
 void BaseTableOperations::logOperation(const QString& operation,

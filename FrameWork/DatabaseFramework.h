@@ -309,52 +309,6 @@ class ITableOperations {
   virtual int getTotalCount() const = 0;
 };
 
-/**
- * @brief 预编译语句缓存类
- */
-class PreparedStatementCache {
- private:
-  QHash<QString, std::shared_ptr<QSqlQuery>> m_cache;
-  QSqlDatabase* m_database;
-  mutable QMutex m_cacheMutex;
-  int m_maxCacheSize = 100;  // 最大缓存数量
-
- public:
-  explicit PreparedStatementCache(QSqlDatabase* db, int maxSize = 100);
-  ~PreparedStatementCache();
-
-  /**
-   * @brief 获取或创建预编译查询
-   * @param sql SQL语句
-   * @return 预编译查询对象
-   */
-  std::shared_ptr<QSqlQuery> getOrCreateQuery(const QString& sql);
-
-  /**
-   * @brief 清除缓存
-   */
-  void clearCache();
-
-  /**
-   * @brief 获取缓存统计信息
-   */
-  struct CacheStats {
-    int cacheSize = 0;
-    int hitCount = 0;
-    int missCount = 0;
-    double hitRate() const {
-      return (hitCount + missCount) > 0
-                 ? (double)hitCount / (hitCount + missCount)
-                 : 0.0;
-    }
-  };
-  CacheStats getStats() const;
-
- private:
-  mutable CacheStats m_stats;
-  void evictOldest();  // LRU淘汰策略
-};
-
 // ============================================================================
 // 基础表操作类（非模板）
 // ============================================================================
@@ -365,9 +319,6 @@ class PreparedStatementCache {
  */
 class BaseTableOperations : public QObject, public ITableOperations {
   Q_OBJECT
-
- private:
-  std::unique_ptr<PreparedStatementCache> m_stmtCache;
 
  public:
   QSqlDatabase* m_database;  // 主连接句柄（不拥有）
@@ -413,7 +364,6 @@ class BaseTableOperations : public QObject, public ITableOperations {
 
  public:
   bool executeQuery(const QString& sql, const QVariantList& params = {}) const;
-  bool executeCachedQuery(const QString& sql, const QVariantList& params) const;
   void logOperation(const QString& operation,
                     const QString& details = "") const;
 };

@@ -54,6 +54,13 @@ bool CameraInfoTableOperations::createTable() {
     logOperation("创建触发器失败", query.lastError().text());
   }
 
+  query.exec(
+      "CREATE INDEX IF NOT EXISTS idx_camera_info_mfr ON "
+      "camera_info(manufacturer)");
+  query.exec(
+      "CREATE INDEX IF NOT EXISTS idx_camera_info_conn ON "
+      "camera_info(connection_type)");
+
   logOperation("创建表成功", m_tableName);
   return true;
 }
@@ -115,20 +122,17 @@ const QString CameraInfoTable::CHECK_SERIAL_EXISTS_SQL = R"(
 CameraInfoTable::CameraInfoTable(QSqlDatabase* db, ConnectionPool* pool,
                                  QObject*)
     : BaseTable<CameraInfo>(nullptr) {
-  m_ops =
-      new CameraInfoTableOperations(db, pool);  // 注意：不设置 QObject parent
+  m_ops = new CameraInfoTableOperations(db, pool);  // QPointer 自动追踪生命周期
   m_baseOps = m_ops;
   m_ops->logOperation("构造函数", "相机信息表业务逻辑对象已创建");
 }
 
-CameraInfoTable::~CameraInfoTable() {
-  // 这里不要 delete/deleteLater：所有权在 BaseDatabaseManager::m_tables 的
-  // unique_ptr
-  m_baseOps = nullptr;
-  m_ops = nullptr;
-}
+CameraInfoTable::~CameraInfoTable() { m_baseOps = nullptr; }
 
 DbResult<int> CameraInfoTable::insert(const CameraInfo& camera) {
+  if (!m_ops) {
+    return DbResult<int>::Error("相机信息表未初始化或已释放");
+  }
   qInfo() << "=== 开始插入相机 ===";
   qInfo() << "相机名称:" << camera.name;
   qInfo() << "序列号:" << camera.serialNumber;
@@ -142,12 +146,6 @@ DbResult<int> CameraInfoTable::insert(const CameraInfo& camera) {
   }
   qInfo() << "数据验证通过";
 
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    qCritical() << "数据库未打开";
-    return DbResult<int>::Error("数据库未打开");
-  }
-  qInfo() << "数据库连接正常";
-
   // 检查序列号是否已存在
   if (serialNumberExists(camera.serialNumber)) {
     qCritical() << "序列号冲突:" << camera.serialNumber;
@@ -156,11 +154,16 @@ DbResult<int> CameraInfoTable::insert(const CameraInfo& camera) {
   }
   qInfo() << "序列号检查通过";
 
+  // ✅ 统一使用连接池
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) {
+    return DbResult<int>::Error("数据库未打开");
+  }
+  qInfo() << "数据库连接正常";
+
   QMutexLocker locker(&m_ops->m_mutex);
-
-  QSqlQuery query(*m_ops->m_database);
+  QSqlQuery query(c.db);  // ✅ 使用池连接而不是主连接
   query.prepare(INSERT_SQL);
-
   qInfo() << "SQL语句:" << INSERT_SQL;
 
   QDateTime now = QDateTime::currentDateTime();
@@ -204,6 +207,9 @@ DbResult<int> CameraInfoTable::insert(const CameraInfo& camera) {
 }
 
 DbResult<bool> CameraInfoTable::update(const CameraInfo& camera) {
+  if (!m_ops) {
+    return DbResult<bool>::Error("相机信息表未初始化或已释放");
+  }
   if (camera.id <= 0) {
     return DbResult<bool>::Error("无效的相机ID");
   }
@@ -214,20 +220,23 @@ DbResult<bool> CameraInfoTable::update(const CameraInfo& camera) {
     return DbResult<bool>::Error(validation.errorMessage);
   }
 
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    return DbResult<bool>::Error("数据库未打开");
-  }
-
   // 检查序列号是否被其他记录使用
   if (serialNumberExists(camera.serialNumber, camera.id)) {
     return DbResult<bool>::Error(
         QString("序列号已被其他设备使用: %1").arg(camera.serialNumber));
   }
 
-  QMutexLocker locker(&m_ops->m_mutex);
+  // ✅ 统一使用连接池
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) {
+    return DbResult<bool>::Error("数据库未打开");
+  }
+  qInfo() << "数据库连接正常";
 
-  QSqlQuery query(*m_ops->m_database);
+  QMutexLocker locker(&m_ops->m_mutex);
+  QSqlQuery query(c.db);  // ✅ 使用池连接而不是主连接
   query.prepare(UPDATE_SQL);
+  qInfo() << "SQL语句:" << UPDATE_SQL;
 
   QDateTime now = QDateTime::currentDateTime();
 
@@ -260,18 +269,24 @@ DbResult<bool> CameraInfoTable::update(const CameraInfo& camera) {
 }
 
 DbResult<bool> CameraInfoTable::deleteById(int id) {
+  if (!m_ops) {
+    return DbResult<bool>::Error("相机信息表未初始化或已释放");
+  }
   if (id <= 0) {
     return DbResult<bool>::Error("无效的相机ID");
   }
 
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
+  // ✅ 统一使用连接池
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) {
     return DbResult<bool>::Error("数据库未打开");
   }
+  qInfo() << "数据库连接正常";
 
   QMutexLocker locker(&m_ops->m_mutex);
-
-  QSqlQuery query(*m_ops->m_database);
+  QSqlQuery query(c.db);  // ✅ 使用池连接而不是主连接
   query.prepare(DELETE_SQL);
+  qInfo() << "SQL语句:" << DELETE_SQL;
   query.addBindValue(id);
 
   if (!query.exec()) {
@@ -292,18 +307,26 @@ DbResult<bool> CameraInfoTable::deleteById(int id) {
 }
 
 DbResult<CameraInfo> CameraInfoTable::selectById(int id) const {
+  if (!m_ops) {
+    return DbResult<CameraInfo>::Error("相机信息表未初始化或已释放");
+  }
+
   if (id <= 0) {
     return DbResult<CameraInfo>::Error("无效的相机ID");
   }
 
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    return DbResult<CameraInfo>::Error("数据库未打开");
+  // ✅ 统一使用连接池
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) {
+    QString error = QString("数据库未打开");
+    return DbResult<CameraInfo>::Error(error);
   }
+  qInfo() << "数据库连接正常";
 
   QMutexLocker locker(&m_ops->m_mutex);
-
-  QSqlQuery query(*m_ops->m_database);
+  QSqlQuery query(c.db);  // ✅ 使用池连接而不是主连接
   query.prepare(SELECT_BY_ID_SQL);
+  qInfo() << "SQL语句:" << SELECT_BY_ID_SQL;
   query.addBindValue(id);
 
   if (!query.exec()) {
@@ -320,13 +343,20 @@ DbResult<CameraInfo> CameraInfoTable::selectById(int id) const {
 }
 
 DbResult<QList<CameraInfo>> CameraInfoTable::selectAll() const {
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    return DbResult<QList<CameraInfo>>::Error("数据库未打开");
+  if (!m_ops) {
+    return DbResult<QList<CameraInfo>>::Error("相机信息表未初始化或已释放");
   }
 
-  QMutexLocker locker(&m_ops->m_mutex);
+  // ✅ 统一使用连接池
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) {
+    return DbResult<QList<CameraInfo>>::Error("数据库未打开");
+  }
+  qInfo() << "数据库连接正常";
 
-  QSqlQuery query(*m_ops->m_database);
+  QMutexLocker locker(&m_ops->m_mutex);
+  QSqlQuery query(c.db);  // ✅ 使用池连接而不是主连接
+
   if (!query.exec(SELECT_ALL_SQL)) {
     QString error =
         QString("查询所有相机失败: %1").arg(query.lastError().text());
@@ -343,6 +373,10 @@ DbResult<QList<CameraInfo>> CameraInfoTable::selectAll() const {
 
 DbResult<PageResult<CameraInfo>> CameraInfoTable::selectByPage(
     const PageParams& params) const {
+  if (!m_ops) {
+    return DbResult<PageResult<CameraInfo>>::Error(
+        "相机信息表未初始化或已释放");
+  }
   auto c = m_ops->acquireDb();
   if (!c.db.isOpen())
     return DbResult<PageResult<CameraInfo>>::Error("数据库未打开");
@@ -376,26 +410,33 @@ DbResult<PageResult<CameraInfo>> CameraInfoTable::selectByPage(
 }
 
 DbResult<int> CameraInfoTable::batchInsert(const QList<CameraInfo>& cameras) {
+  if (!m_ops) {
+    return DbResult<int>::Error("相机信息表未初始化或已释放");
+  }
+
   if (cameras.isEmpty()) {
     return DbResult<int>::Error("相机列表为空");
   }
 
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
+  // ✅ 统一使用连接池
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) {
     return DbResult<int>::Error("数据库未打开");
   }
+  qInfo() << "数据库连接正常";
 
   QMutexLocker locker(&m_ops->m_mutex);
+  QSqlQuery query(c.db);  // ✅ 使用池连接而不是主连接
+  query.prepare(INSERT_SQL);
+  qInfo() << "SQL语句:" << INSERT_SQL;
 
   // 开启事务
-  if (!m_ops->m_database->transaction()) {
+  if (!c.db.transaction()) {
     return DbResult<int>::Error("无法开启事务");
   }
 
   int successCount = 0;
   QStringList errors;
-
-  QSqlQuery query(*m_ops->m_database);
-  query.prepare(INSERT_SQL);
 
   QDateTime now = QDateTime::currentDateTime();
 
@@ -434,18 +475,18 @@ DbResult<int> CameraInfoTable::batchInsert(const QList<CameraInfo>& cameras) {
     }
   }
 
-  // 提交或回滚事务
   if (successCount > 0) {
-    if (m_ops->m_database->commit()) {
+    if (c.db.commit()) {
+      // ✅ 提交池里这条连接的事务
       m_ops->logOperation("批量插入成功",
                           QString("成功插入 %1 个相机").arg(successCount));
       return DbResult<int>::Success(successCount);
     } else {
-      m_ops->m_database->rollback();
+      c.db.rollback();  // ✅ 回滚同一连接
       return DbResult<int>::Error("提交事务失败");
     }
   } else {
-    m_ops->m_database->rollback();
+    c.db.rollback();
     return DbResult<int>::Error(
         QString("批量插入失败: %1").arg(errors.join("; ")));
   }
@@ -453,17 +494,22 @@ DbResult<int> CameraInfoTable::batchInsert(const QList<CameraInfo>& cameras) {
 
 DbResult<CameraInfo> CameraInfoTable::selectBySerialNumber(
     const QString& serialNumber) const {
+  if (!m_ops) {
+    return DbResult<CameraInfo>::Error("相机信息表未初始化或已释放");
+  }
+
   if (serialNumber.isEmpty()) {
     return DbResult<CameraInfo>::Error("序列号不能为空");
   }
 
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    return DbResult<CameraInfo>::Error("数据库未打开");
+  if (!m_ops) {
+    return DbResult<CameraInfo>::Error("相机信息表未初始化或已释放");
   }
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) return DbResult<CameraInfo>::Error("数据库未打开");
 
   QMutexLocker locker(&m_ops->m_mutex);
-
-  QSqlQuery query(*m_ops->m_database);
+  QSqlQuery query(c.db);
   query.prepare(SELECT_BY_SERIAL_SQL);
   query.addBindValue(serialNumber);
 
@@ -483,13 +529,13 @@ DbResult<CameraInfo> CameraInfoTable::selectBySerialNumber(
 
 bool CameraInfoTable::serialNumberExists(const QString& serialNumber,
                                          int excludeId) const {
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    return false;
-  }
+  if (!m_ops) return false;
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) return false;
 
   QMutexLocker locker(&m_ops->m_mutex);
 
-  QSqlQuery query(*m_ops->m_database);
+  QSqlQuery query(c.db);
   query.prepare(CHECK_SERIAL_EXISTS_SQL);
   query.addBindValue(serialNumber);
   query.addBindValue(excludeId);
@@ -503,42 +549,42 @@ bool CameraInfoTable::serialNumberExists(const QString& serialNumber,
 
 DbResult<QList<CameraInfo>> CameraInfoTable::search(
     const QString& keyword) const {
-  if (keyword.isEmpty()) {
-    return selectAll();
+  if (!m_ops) {
+    return DbResult<QList<CameraInfo>>::Error("相机信息表未初始化或已释放");
   }
 
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    return DbResult<QList<CameraInfo>>::Error("数据库未打开");
-  }
+  if (keyword.isEmpty()) return selectAll();
+
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) return DbResult<QList<CameraInfo>>::Error("数据库未打开");
 
   QMutexLocker locker(&m_ops->m_mutex);
-
-  QSqlQuery query(*m_ops->m_database);
+  QSqlQuery query(c.db);
   query.prepare(SEARCH_SQL);
 
-  QString searchPattern = QString("%%1%").arg(keyword);
-  query.addBindValue(searchPattern);
-  query.addBindValue(searchPattern);
-  query.addBindValue(searchPattern);
+  const QString pattern = "%" + keyword + "%";  // ✅ 修正
+  query.addBindValue(pattern);
+  query.addBindValue(pattern);
+  query.addBindValue(pattern);
 
   if (!query.exec()) {
-    QString error = QString("搜索相机失败: %1").arg(query.lastError().text());
-    return DbResult<QList<CameraInfo>>::Error(error);
+    return DbResult<QList<CameraInfo>>::Error(
+        QString("搜索相机失败: %1").arg(query.lastError().text()));
   }
 
-  QList<CameraInfo> cameras;
-  while (query.next()) {
-    cameras.append(buildCameraInfo(query));
-  }
-
-  return DbResult<QList<CameraInfo>>::Success(cameras);
+  QList<CameraInfo> out;
+  while (query.next()) out.append(buildCameraInfo(query));
+  return DbResult<QList<CameraInfo>>::Success(out);
 }
 
 DbResult<QList<CameraInfo>> CameraInfoTable::selectByManufacturer(
     const QString& manufacturer) const {
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    return DbResult<QList<CameraInfo>>::Error("数据库未打开");
+  if (!m_ops) {
+    return DbResult<QList<CameraInfo>>::Error("相机信息表未初始化或已释放");
   }
+
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) return DbResult<QList<CameraInfo>>::Error("数据库未打开");
 
   QMutexLocker locker(&m_ops->m_mutex);
 
@@ -547,7 +593,7 @@ DbResult<QList<CameraInfo>> CameraInfoTable::selectByManufacturer(
         FROM camera_info WHERE manufacturer = ? ORDER BY name
     )";
 
-  QSqlQuery query(*m_ops->m_database);
+  QSqlQuery query(c.db);
   query.prepare(sql);
   query.addBindValue(manufacturer);
 
@@ -566,9 +612,9 @@ DbResult<QList<CameraInfo>> CameraInfoTable::selectByManufacturer(
 }
 
 QStringList CameraInfoTable::getAllManufacturers() const {
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    return QStringList();
-  }
+  if (!m_ops) return {};
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) return {};
 
   QMutexLocker locker(&m_ops->m_mutex);
 
@@ -576,7 +622,7 @@ QStringList CameraInfoTable::getAllManufacturers() const {
       "SELECT DISTINCT manufacturer FROM camera_info WHERE manufacturer IS NOT "
       "NULL ORDER BY manufacturer";
 
-  QSqlQuery query(*m_ops->m_database);
+  QSqlQuery query(c.db);
   if (!query.exec(sql)) {
     return QStringList();
   }
@@ -594,9 +640,10 @@ QStringList CameraInfoTable::getAllManufacturers() const {
 
 DbResult<QList<CameraInfo>> CameraInfoTable::selectByConnectionType(
     const QString& connectionType) const {
-  if (!m_ops->m_database || !m_ops->m_database->isOpen()) {
-    return DbResult<QList<CameraInfo>>::Error("数据库未打开");
-  }
+  if (!m_ops)
+    return DbResult<QList<CameraInfo>>::Error("相机信息表未初始化或已释放");
+  auto c = m_ops->acquireDb();
+  if (!c.db.isOpen()) return DbResult<QList<CameraInfo>>::Error("数据库未打开");
 
   QMutexLocker locker(&m_ops->m_mutex);
 
@@ -605,7 +652,7 @@ DbResult<QList<CameraInfo>> CameraInfoTable::selectByConnectionType(
         FROM camera_info WHERE connection_type = ? ORDER BY name
     )";
 
-  QSqlQuery query(*m_ops->m_database);
+  QSqlQuery query(c.db);
   query.prepare(sql);
   query.addBindValue(connectionType);
 
@@ -699,6 +746,11 @@ DeviceDatabaseManager::DeviceDatabaseManager(const DatabaseConfig& config,
                                              QObject* parent)
     : BaseDatabaseManager(DatabaseType::DEVICE_DB, config, parent) {
   qInfo() << "创建设备数据库管理器";
+}
+
+void DeviceDatabaseManager::close() {
+  m_cameraInfoTable.reset();     // 先释放业务表，避免悬空
+  BaseDatabaseManager::close();  // 再做通用清理
 }
 
 void DeviceDatabaseManager::registerTables() {

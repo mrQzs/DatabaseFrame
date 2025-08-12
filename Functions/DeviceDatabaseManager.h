@@ -3,6 +3,7 @@
 #define DEVICE_DATABASE_MANAGER_H
 
 #include <QDateTime>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QSet>
 
@@ -137,6 +138,22 @@ struct CameraStatus {
 class CameraInfoTableOperations : public BaseTableOperations {
   Q_OBJECT
  public:
+  struct TxGuard {
+    QSqlDatabase& db;
+    bool active = false;
+    explicit TxGuard(QSqlDatabase& d) : db(d) { active = db.transaction(); }
+    ~TxGuard() {
+      if (active) db.rollback();
+    }
+    bool commit() {
+      if (!active) return false;
+      bool ok = db.commit();
+      active = false;
+      return ok;
+    }
+  };
+
+ public:
   explicit CameraInfoTableOperations(QSqlDatabase* db, ConnectionPool* pool);
   ~CameraInfoTableOperations() override = default;
 
@@ -163,8 +180,7 @@ class CameraInfoTable : public BaseTable<CameraInfo> {
   static const QString COUNT_SQL;
   static const QString CHECK_SERIAL_EXISTS_SQL;
 
-  CameraInfoTableOperations* m_ops;  ///< 基础操作对象指针
-
+  QPointer<CameraInfoTableOperations> m_ops;  ///< 安全弱引用，避免悬空
  public:
   /**
    * @brief 构造函数
@@ -284,7 +300,7 @@ class CameraInfoTable : public BaseTable<CameraInfo> {
    * @brief 获取基础操作对象
    * @return 基础操作对象指针
    */
-  CameraInfoTableOperations* operations() const { return m_ops; }
+  CameraInfoTableOperations* operations() const { return m_ops.data(); }
 
  private:
   /**
@@ -347,6 +363,8 @@ class DeviceDatabaseManager : public BaseDatabaseManager {
   // ========================================================================
   // 表访问器
   // ========================================================================
+
+  void close() override;
 
   /**
    * @brief 获取相机信息表操作对象

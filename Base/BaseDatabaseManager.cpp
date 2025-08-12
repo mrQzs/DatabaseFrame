@@ -2,68 +2,78 @@
 #include "BaseDatabaseManager.h"
 
 #include <QElapsedTimer>
+#include <QThread>
 
 // ============================================================================
 // 连接池实现
 // ============================================================================
 
 ConnectionPool::ConnectionPool(const DatabaseConfig& config)
-    : m_connectionNamePrefix(config.connectionName), m_config(config) {
-  // 预创建一些连接
-  for (int i = 0; i < qMin(3, config.maxConnections); ++i) {
-    QString connName = createConnection();
-    if (!connName.isEmpty()) {
-      m_availableConnections.enqueue(connName);
-    }
-  }
-}
+    : m_connectionNamePrefix(config.connectionName), m_config(config) {}
 
 ConnectionPool::~ConnectionPool() {
   QMutexLocker locker(&m_mutex);
-
-  // 关闭所有连接
-  while (!m_availableConnections.isEmpty()) {
-    QString connName = m_availableConnections.dequeue();
-    QSqlDatabase::removeDatabase(connName);
+  // 先清空可用
+  for (auto& q : m_availableByThread) {
+    while (!q.isEmpty()) QSqlDatabase::removeDatabase(q.dequeue());
   }
-
-  for (const QString& connName : m_usedConnections) {
-    QSqlDatabase::removeDatabase(connName);
+  // 再移除使用中（理论上关闭前应已归还）
+  for (const QString& name : m_usedConnections) {
+    QSqlDatabase::removeDatabase(name);
   }
+  m_usedConnections.clear();
+  m_connOwner.clear();
 }
 
 QString ConnectionPool::acquireConnection() {
   QMutexLocker locker(&m_mutex);
+  const QString tid = currentTid();
 
-  QString connectionName;
-
-  if (!m_availableConnections.isEmpty()) {
-    // 使用现有连接
-    connectionName = m_availableConnections.dequeue();
-  } else if (m_usedConnections.size() < m_config.maxConnections) {
-    // 创建新连接
-    connectionName = createConnection();
+  // 若该线程有活动事务，则强制复用该连接
+  if (m_activeTxByThread.contains(tid)) {
+    const QString name = m_activeTxByThread.value(tid);
+    return name;
   }
 
-  if (!connectionName.isEmpty()) {
-    m_usedConnections.insert(connectionName);
+  auto& q = m_availableByThread[tid];
+  if (!q.isEmpty()) {
+    QString name = q.dequeue();
+    m_usedConnections.insert(name);
+    return name;
   }
 
-  return connectionName;
+  // 全局连接总数达上限则失败
+  if (totalConnectionsUnsafe() >= m_config.maxConnections) return QString();
+
+  QString name = createConnectionInCurrentThread();  // 在当前线程创建
+  if (!name.isEmpty()) {
+    m_connOwner.insert(name, tid);
+    m_usedConnections.insert(name);
+  }
+  return name;
 }
 
-void ConnectionPool::releaseConnection(const QString& connectionName) {
+void ConnectionPool::releaseConnection(const QString& name) {
   QMutexLocker locker(&m_mutex);
-
-  if (m_usedConnections.contains(connectionName)) {
-    m_usedConnections.remove(connectionName);
-    m_availableConnections.enqueue(connectionName);
+  if (!m_usedConnections.contains(name)) return;
+  // 若该连接正被某线程作为活动事务绑定，则忽略释放
+  const QString ownerTid = m_connOwner.value(name, currentTid());
+  if (m_activeTxByThread.value(ownerTid) == name) {
+    return;  // 事务结束时统一释放
   }
+  m_usedConnections.remove(name);
+  const QString tid = m_connOwner.value(name, currentTid());
+  m_availableByThread[tid].enqueue(name);
 }
 
 int ConnectionPool::availableCount() const {
   QMutexLocker locker(&m_mutex);
-  return m_availableConnections.size();
+  int total = 0;
+  for (auto it = m_availableByThread.constBegin();
+       it != m_availableByThread.constEnd(); ++it) {
+    total += it.value().size();
+  }
+  return total;
 }
 
 int ConnectionPool::usedCount() const {
@@ -93,6 +103,31 @@ QString ConnectionPool::createConnection() {
   return connectionName;
 }
 
+QString ConnectionPool::createConnectionInCurrentThread() {
+  QString threadId =
+      QString::number(reinterpret_cast<qintptr>(QThread::currentThread()));
+  QString connectionName = QString("%1_%2_%3")
+                               .arg(m_config.connectionName)
+                               .arg(threadId)
+                               .arg(++m_connectionCounter);
+
+  // 在当前线程中创建并打开连接
+  QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE", connectionName);
+  db.setDatabaseName(m_config.filePath);
+  db.setConnectOptions(
+      QString("QSQLITE_BUSY_TIMEOUT=%1").arg(m_config.busyTimeout));
+
+  if (!db.open()) {
+    qWarning() << "Failed to create database connection in thread"
+               << QThread::currentThread() << ":" << db.lastError().text();
+    QSqlDatabase::removeDatabase(connectionName);
+    return QString();
+  }
+
+  configureDatabase(db);
+  return connectionName;
+}
+
 void ConnectionPool::configureDatabase(QSqlDatabase& db) {
   QSqlQuery query(db);
 
@@ -111,6 +146,73 @@ void ConnectionPool::configureDatabase(QSqlDatabase& db) {
 
   // 设置缓存大小
   query.exec("PRAGMA cache_size = 10000");
+}
+
+// ---- 线程事务：开始/提交/回滚 ----
+QString ConnectionPool::beginThreadTransaction() {
+  QMutexLocker locker(&m_mutex);
+  const QString tid = currentTid();
+  if (m_activeTxByThread.contains(tid)) {
+    return m_activeTxByThread.value(tid);  // 已有事务，复用
+  }
+
+  QString name;
+  auto& q = m_availableByThread[tid];
+  if (!q.isEmpty()) {
+    name = q.dequeue();
+    m_usedConnections.insert(name);
+  } else {
+    if (totalConnectionsUnsafe() >= m_config.maxConnections) return QString();
+    name = createConnectionInCurrentThread();
+    if (!name.isEmpty()) {
+      m_connOwner.insert(name, tid);
+      m_usedConnections.insert(name);
+    }
+  }
+  if (name.isEmpty()) return QString();
+
+  // 在这条连接上开启事务
+  locker.unlock();
+  QSqlDatabase db = QSqlDatabase::database(name);
+  if (!db.isOpen() || !db.transaction()) {
+    locker.relock();
+    // 回退：放回可用队列
+    m_usedConnections.remove(name);
+    m_availableByThread[tid].enqueue(name);
+    return QString();
+  }
+  locker.relock();
+  m_activeTxByThread.insert(tid, name);
+  return name;
+}
+
+bool ConnectionPool::commitThreadTransaction() {
+  QString name;
+  {
+    QMutexLocker locker(&m_mutex);
+    const QString tid = currentTid();
+    name = m_activeTxByThread.take(tid);
+  }
+  if (name.isEmpty()) return false;
+  QSqlDatabase db = QSqlDatabase::database(name);
+  bool ok = db.commit();
+  // 提交后归还连接
+  releaseConnection(name);
+  return ok;
+}
+
+bool ConnectionPool::rollbackThreadTransaction() {
+  QString name;
+  {
+    QMutexLocker locker(&m_mutex);
+    const QString tid = currentTid();
+    name = m_activeTxByThread.take(tid);
+  }
+  if (name.isEmpty()) return false;
+  QSqlDatabase db = QSqlDatabase::database(name);
+  bool ok = db.rollback();
+  releaseConnection(name);
+  return ok;
 }
 
 // ============================================================================
@@ -233,6 +335,8 @@ void BaseDatabaseManager::close() {
     m_database.close();
   }
 
+  m_database = QSqlDatabase();
+
   // 移除数据库连接
   if (QSqlDatabase::contains(connectionName)) {
     QSqlDatabase::removeDatabase(connectionName);
@@ -248,59 +352,67 @@ bool BaseDatabaseManager::isOpen() const {
 
 bool BaseDatabaseManager::beginTransaction() {
   QMutexLocker locker(&m_dbMutex);
-
+  // 优先使用连接池的“线程事务”，以绑定具体连接
+  if (m_connectionPool) {
+    const QString name = m_connectionPool->beginThreadTransaction();
+    if (name.isEmpty()) {
+      qWarning() << "开始线程事务失败";
+      return false;
+    }
+    emit transactionBegin();
+    qDebug() << "事务开始（池连接）:" << name;
+    return true;
+  }
+  // 回退到主连接（无连接池）
   if (!m_database.isOpen()) {
     qWarning() << "数据库未打开，无法开始事务";
     return false;
   }
-
-  bool success = m_database.transaction();
-  if (success) {
-    emit transactionBegin();
-    qDebug() << "事务开始";
-  } else {
-    qWarning() << "开始事务失败:" << m_database.lastError().text();
-  }
-
-  return success;
+  const bool ok = m_database.transaction();
+  if (ok) emit transactionBegin();
+  return ok;
 }
 
 bool BaseDatabaseManager::commitTransaction() {
   QMutexLocker locker(&m_dbMutex);
-
+  if (m_connectionPool) {
+    const bool ok = m_connectionPool->commitThreadTransaction();
+    if (!ok) {
+      qWarning() << "提交线程事务失败";
+      return false;
+    }
+    emit transactionCommitted();
+    qDebug() << "事务提交成功（池连接）";
+    return true;
+  }
   if (!m_database.isOpen()) {
     qWarning() << "数据库未打开，无法提交事务";
     return false;
   }
-
-  bool success = m_database.commit();
-  if (success) {
-    emit transactionCommitted();
-    qDebug() << "事务提交成功";
-  } else {
-    qWarning() << "提交事务失败:" << m_database.lastError().text();
-  }
-
-  return success;
+  const bool ok = m_database.commit();
+  if (ok) emit transactionCommitted();
+  return ok;
 }
 
 bool BaseDatabaseManager::rollbackTransaction() {
   QMutexLocker locker(&m_dbMutex);
-
+  if (m_connectionPool) {
+    const bool ok = m_connectionPool->rollbackThreadTransaction();
+    if (!ok) {
+      qWarning() << "回滚线程事务失败";
+      return false;
+    }
+    emit transactionRolledBack();
+    qDebug() << "事务回滚成功（池连接）";
+    return true;
+  }
   if (!m_database.isOpen()) {
     qWarning() << "数据库未打开，无法回滚事务";
     return false;
   }
-
-  bool success = m_database.rollback();
-  if (success) {
-    emit transactionRolledBack();
-    qDebug() << "事务回滚成功";
-  } else {
-    qWarning() << "回滚事务失败:" << m_database.lastError().text();
-  }
-
-  return success;
+  const bool ok = m_database.rollback();
+  if (ok) emit transactionRolledBack();
+  return ok;
 }
 
 void BaseDatabaseManager::registerTable(
@@ -506,8 +618,14 @@ void BaseDatabaseManager::resetStatistics() {
 }
 
 qint64 BaseDatabaseManager::getDatabaseSize() const {
-  QFileInfo fileInfo(m_config.filePath);
-  return fileInfo.exists() ? fileInfo.size() : 0;
+  qint64 total = 0;
+  QFileInfo mainFi(m_config.filePath);
+  if (mainFi.exists()) total += mainFi.size();
+  QFileInfo walFi(m_config.filePath + "-wal");
+  if (walFi.exists()) total += walFi.size();
+  QFileInfo shmFi(m_config.filePath + "-shm");
+  if (shmFi.exists()) total += shmFi.size();
+  return total;
 }
 
 bool BaseDatabaseManager::createDatabaseDirectory() {
