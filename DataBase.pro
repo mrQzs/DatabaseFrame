@@ -53,13 +53,16 @@ CONFIG(debug, debug|release) {
 HEADERS += \
     Base/BaseDatabaseManager.h \
     FrameWork/DatabaseFramework.h \
-    Functions/DeviceDatabaseManager.h \
+    Functions/DeviceDatabaseManager/CameraInfoTable.h \
+    Functions/DeviceDatabaseManager/DeviceDataBaseStruct.h \
+    Functions/DeviceDatabaseManager/DeviceDatabaseManager.h \
     Registry/DatabaseRegistry.h \
     Test/DatabaseTestExample.h
 
 SOURCES += \
     Base/BaseDatabaseManager.cpp \
     FrameWork/DatabaseFramework.cpp \
-    Functions/DeviceDatabaseManager.cpp \
+    Functions/DeviceDatabaseManager/CameraInfoTable.cpp \
+    Functions/DeviceDatabaseManager/DeviceDatabaseManager.cpp \
     Registry/DatabaseRegistry.cpp \
     main.cpp

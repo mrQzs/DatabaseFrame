@@ -50,6 +50,11 @@ DatabaseConfig DatabaseConfig::fromFile(const QString& configPath) {
     config.configSource = configPath;
   }
 
+  // 确保 connectionName 非空
+  if (config.connectionName.isEmpty()) {
+    config.connectionName =
+        config.dbName + "_" + QUuid::createUuid().toString();
+  }
   return config;
 }
 
@@ -73,6 +78,12 @@ DatabaseConfig DatabaseConfig::fromEnvironment(const QString& prefix) {
   if (ok) config.busyTimeout = timeout;
 
   config.configSource = "Environment:" + prefix;
+
+  // 确保 connectionName 非空
+  if (config.connectionName.isEmpty()) {
+    config.connectionName =
+        config.dbName + "_" + QUuid::createUuid().toString();
+  }
   return config;
 }
 
@@ -119,11 +130,25 @@ BaseTableOperations::ScopedDb::~ScopedDb() {
 }
 
 BaseTableOperations::ScopedDb BaseTableOperations::acquireDb() const {
+  qDebug() << "BaseTableOperations::acquireDb() 开始";
+
   if (m_pool) {
+    qDebug() << "使用连接池获取连接...";
     const QString name = m_pool->acquireConnection();
-    return ScopedDb{name, QSqlDatabase::database(name), m_pool};
+    qDebug() << "连接池返回连接名:" << name;
+
+    if (name.isEmpty()) {
+      qWarning() << "连接池耗尽或获取失败，返回无效连接";
+      return ScopedDb{QString(), QSqlDatabase(), m_pool};
+    }
+
+    QSqlDatabase db = QSqlDatabase::database(name);
+    qDebug() << "获取数据库对象，isOpen:" << db.isOpen();
+
+    return ScopedDb{name, db, m_pool};
   }
-  // 无连接池：直接复制主连接句柄（不负责关闭）
+
+  qDebug() << "使用主连接（无连接池）";
   return ScopedDb{QString(), *m_database, nullptr};
 }
 

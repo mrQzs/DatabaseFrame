@@ -6,6 +6,7 @@
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QMutex>
+#include <QPointer>
 #include <QQueue>
 #include <QSqlDatabase>
 #include <QSqlError>
@@ -33,10 +34,14 @@ class ConnectionPool {
   QHash<QString, QString> m_connOwner;                  // connName -> threadId
   QHash<QString, QString>
       m_activeTxByThread;  // threadId -> connName  (活动事务绑定)
+  QHash<QString, QPointer<QThread>> m_threadRefs;
 
   static QString currentTid() {
     return QString::number(reinterpret_cast<qintptr>(QThread::currentThread()));
   }
+
+  void cleanupFinishedThreads();
+
   int totalConnectionsUnsafe() const {
     int n = m_usedConnections.size();
     for (const auto& q : m_availableByThread) n += q.size();
@@ -66,6 +71,9 @@ class ConnectionPool {
    * @param connectionName 连接名称
    */
   void releaseConnection(const QString& connectionName);
+
+  // 关闭所有空闲连接，返回关闭数量
+  int forceCloseIdleConnections();
 
   /**
    * @brief 获取可用连接数

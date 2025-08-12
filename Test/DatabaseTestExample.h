@@ -10,6 +10,8 @@
 #include <thread>
 
 #include "DatabaseRegistry.h"
+#include "DeviceDatabaseManager/CameraInfoTable.h"
+#include "DeviceDatabaseManager/DeviceDataBaseStruct.h"
 
 #ifdef _WIN32
 #include <Windows.h>

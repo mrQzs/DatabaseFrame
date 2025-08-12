@@ -10,7 +10,7 @@
 #include <unordered_map>
 
 #include "BaseDatabaseManager.h"
-#include "DeviceDatabaseManager.h"
+#include "DeviceDatabaseManager/DeviceDatabaseManager.h"
 
 /**
  * @brief 数据库注册中心

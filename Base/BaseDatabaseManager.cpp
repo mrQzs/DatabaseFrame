@@ -8,6 +8,23 @@
 // 连接池实现
 // ============================================================================
 
+void ConnectionPool::cleanupFinishedThreads() {
+  // 移除已结束线程的可用连接队列，避免被新线程（指针地址复用）误用
+  QList<QString> stale;
+  for (auto it = m_threadRefs.begin(); it != m_threadRefs.end(); ++it) {
+    if (it.value().isNull()) stale.append(it.key());
+  }
+  for (const QString& tid : stale) {
+    auto& q = m_availableByThread[tid];
+    while (!q.isEmpty()) {
+      QSqlDatabase::removeDatabase(q.dequeue());
+    }
+    m_availableByThread.remove(tid);
+    m_activeTxByThread.remove(tid);
+    m_threadRefs.remove(tid);
+  }
+}
+
 ConnectionPool::ConnectionPool(const DatabaseConfig& config)
     : m_connectionNamePrefix(config.connectionName), m_config(config) {}
 
@@ -28,6 +45,9 @@ ConnectionPool::~ConnectionPool() {
 QString ConnectionPool::acquireConnection() {
   QMutexLocker locker(&m_mutex);
   const QString tid = currentTid();
+
+  cleanupFinishedThreads();
+  m_threadRefs.insert(tid, QThread::currentThread());
 
   // 若该线程有活动事务，则强制复用该连接
   if (m_activeTxByThread.contains(tid)) {
@@ -55,6 +75,7 @@ QString ConnectionPool::acquireConnection() {
 
 void ConnectionPool::releaseConnection(const QString& name) {
   QMutexLocker locker(&m_mutex);
+  cleanupFinishedThreads();
   if (!m_usedConnections.contains(name)) return;
   // 若该连接正被某线程作为活动事务绑定，则忽略释放
   const QString ownerTid = m_connOwner.value(name, currentTid());
@@ -64,6 +85,20 @@ void ConnectionPool::releaseConnection(const QString& name) {
   m_usedConnections.remove(name);
   const QString tid = m_connOwner.value(name, currentTid());
   m_availableByThread[tid].enqueue(name);
+}
+
+int ConnectionPool::forceCloseIdleConnections() {
+  QMutexLocker locker(&m_mutex);
+  int closed = 0;
+  for (auto it = m_availableByThread.begin(); it != m_availableByThread.end();
+       ++it) {
+    auto& q = it.value();
+    while (!q.isEmpty()) {
+      QSqlDatabase::removeDatabase(q.dequeue());
+      ++closed;
+    }
+  }
+  return closed;
 }
 
 int ConnectionPool::availableCount() const {
@@ -250,6 +285,11 @@ bool BaseDatabaseManager::initialize() {
                  .arg(m_config.filePath);
 
   try {
+    // 若连接池已在 close() 中释放，则此处重建
+    if (!m_connectionPool) {
+      m_connectionPool = std::make_unique<ConnectionPool>(m_config);
+    }
+
     // 创建数据库目录
     if (!createDatabaseDirectory()) {
       emit databaseError("创建数据库目录失败");
@@ -294,7 +334,9 @@ bool BaseDatabaseManager::initialize() {
     }
 
     // 初始化健康检查
+    qInfo() << "数据库表创建阶段完成，开始初始化健康检查...";
     initializeHealthCheck();
+    qInfo() << "健康检查初始化完成";
 
     qInfo() << QString("数据库初始化完成 [%1]").arg(m_config.dbName);
     emit databaseInitialized(true);
@@ -321,6 +363,11 @@ void BaseDatabaseManager::close() {
 
   // 清理表对象
   m_tables.clear();
+
+  // 先销毁连接池，确保不再持有任何数据库文件句柄（包含 WAL/-shm）
+  if (m_connectionPool) {
+    m_connectionPool.reset();
+  }
 
   // 确保所有查询都已完成
   if (m_database.isOpen()) {
@@ -431,15 +478,28 @@ ITableOperations* BaseDatabaseManager::getTable(TableType tableType) {
 bool BaseDatabaseManager::createAllTables() {
   qInfo() << QString("开始创建所有数据表 [%1]").arg(m_config.dbName);
 
+  // 添加调试信息
+  qDebug() << "表总数:" << m_tables.size();
+  qDebug() << "当前线程ID:" << QThread::currentThreadId();
+
   int successCount = 0;
   int totalCount = m_tables.size();
+
+  qDebug() << "开始遍历表集合...";
 
   for (const auto& pair : m_tables) {
     TableType tableType = pair.first;
     const auto& table = pair.second;
 
+    qDebug() << "=== 处理表 ===" << static_cast<int>(tableType)
+             << table->tableName();
+
     try {
-      if (table->createTable()) {
+      qDebug() << "调用 createTable() 方法...";
+      bool result = table->createTable();
+      qDebug() << "createTable() 返回结果:" << result;
+
+      if (result) {
         successCount++;
         qInfo() << QString("创建表成功: %1").arg(table->tableName());
       } else {
@@ -450,11 +510,19 @@ bool BaseDatabaseManager::createAllTables() {
                          .arg(table->tableName())
                          .arg(e.what());
     }
+
+    qDebug() << "当前进度:" << successCount << "/" << totalCount;
   }
 
+  qDebug() << "for循环结束，准备输出最终日志...";
   qInfo()
       << QString("表创建完成: %1/%2 成功").arg(successCount).arg(totalCount);
-  return successCount == totalCount;
+
+  qDebug() << "准备返回结果...";
+  bool finalResult = (successCount == totalCount);
+  qDebug() << "最终结果:" << finalResult;
+
+  return finalResult;
 }
 
 bool BaseDatabaseManager::dropAllTables() {
@@ -492,9 +560,13 @@ bool BaseDatabaseManager::healthCheck() {
     return false;
   }
 
-  // 执行简单查询测试连接
+  // 执行简单查询测试连接 + 统计
+  QElapsedTimer timer;
+  timer.start();
   QSqlQuery query(m_database);
   bool healthy = query.exec("SELECT 1");
+  // 记一次统计（无论成功失败都计数，方便观测）
+  recordQueryStats(healthy, static_cast<double>(timer.elapsed()));
 
   if (!healthy) {
     qWarning() << QString("数据库健康检查失败 [%1]: %2")
@@ -514,19 +586,45 @@ bool BaseDatabaseManager::optimizeDatabase() {
 
   qInfo() << QString("开始优化数据库 [%1]").arg(m_config.dbName);
 
+  // 清空空闲池连接；若仍有活跃连接，则直接返回失败，避免 VACUUM 被并发阻塞
+  if (m_connectionPool) {
+    m_connectionPool->forceCloseIdleConnections();
+    if (m_connectionPool->usedCount() > 0) {
+      qWarning() << "存在活跃池连接，跳过 VACUUM/ANALYZE";
+      return false;
+    }
+  }
   QSqlQuery query(m_database);
   bool success = true;
 
-  // 执行VACUUM
-  if (!query.exec("VACUUM")) {
-    qWarning() << "VACUUM失败:" << query.lastError().text();
-    success = false;
+  if (m_config.enableWAL) {
+    QElapsedTimer t;
+    t.start();
+    bool walOk = query.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    recordQueryStats(walOk, static_cast<double>(t.elapsed()));
+    // walOk 失败不立即置 overall 失败，仅记录日志由下面流程汇总
   }
 
-  // 执行ANALYZE
-  if (!query.exec("ANALYZE")) {
-    qWarning() << "ANALYZE失败:" << query.lastError().text();
-    success = false;
+  {
+    QElapsedTimer t;
+    t.start();
+    bool ok = query.exec("VACUUM");
+    recordQueryStats(ok, static_cast<double>(t.elapsed()));
+    if (!ok) {
+      qWarning() << "VACUUM失败:" << query.lastError().text();
+      success = false;
+    }
+  }
+
+  {
+    QElapsedTimer t;
+    t.start();
+    bool ok = query.exec("ANALYZE");
+    recordQueryStats(ok, static_cast<double>(t.elapsed()));
+    if (!ok) {
+      qWarning() << "ANALYZE失败:" << query.lastError().text();
+      success = false;
+    }
   }
 
   qInfo() << QString("数据库优化完成 [%1]: %2")
@@ -560,7 +658,12 @@ bool BaseDatabaseManager::backupDatabase(const QString& backupPath) {
   QSqlQuery query(m_database);
   QString sql = QString("VACUUM INTO '%1'").arg(backupPath);
 
-  if (query.exec(sql)) {
+  QElapsedTimer t;
+  t.start();
+  bool ok = query.exec(sql);
+  recordQueryStats(ok, static_cast<double>(t.elapsed()));
+
+  if (ok) {
     qInfo() << QString("数据库备份完成 [%1]").arg(m_config.dbName);
     return true;
   } else {
@@ -717,7 +820,20 @@ bool BaseDatabaseManager::executeQueryWithStats(const QString& queryStr,
   QElapsedTimer timer;
   timer.start();
 
-  QSqlQuery query(m_database);
+  QString pooledName;
+  QSqlDatabase dbToUse = m_database;
+  if (m_connectionPool) {
+    pooledName = m_connectionPool->acquireConnection();
+    if (!pooledName.isEmpty())
+      dbToUse = QSqlDatabase::database(pooledName);
+    else {
+      double qt = timer.elapsed();
+      recordQueryStats(false, qt);
+      qWarning() << "统计查询获取池连接失败";
+      return false;
+    }
+  }
+  QSqlQuery query(dbToUse);
   query.prepare(queryStr);
 
   for (const auto& param : params) {
@@ -734,6 +850,9 @@ bool BaseDatabaseManager::executeQueryWithStats(const QString& queryStr,
     qWarning() << "SQL语句:" << queryStr;
   }
 
+  if (m_connectionPool && !pooledName.isEmpty()) {
+    m_connectionPool->releaseConnection(pooledName);
+  }
   return success;
 }
 
